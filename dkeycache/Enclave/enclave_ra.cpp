@@ -48,9 +48,15 @@
 
 uint8_t g_domain_key[SGX_DOMAIN_KEY_SIZE] = {0};
 
+SSL *g_ssl_session = nullptr;
+
+char *g_server_name = nullptr;
+
+uint16_t g_server_port = 0;
+
 int verify_callback(int preverify_ok, X509_STORE_CTX *ctx);
 
-void log_printf(uint32_t log_level, const char* filename, uint32_t line, const char *fmt, ...)
+void log_printf(uint32_t log_level, const char *filename, uint32_t line, const char *fmt, ...)
 {
     char buf[BUFSIZ] = {'\0'};
     va_list ap;
@@ -112,8 +118,160 @@ unsigned long inet_addr2(const char *str)
     return lHost;
 }
 
-// This routine conducts a simple HTTP request/response communication with server
-int communicate_with_server(SSL *ssl)
+// create a socket and connect to the server_name:server_port
+int create_socket(const char *server_name, uint16_t server_port)
+{
+    int sockfd = -1;
+    struct sockaddr_in dest_sock;
+    int res = -1;
+
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd == -1)
+    {
+        log_d(TLS_CLIENT "Error: Cannot create socket %d.\n", errno);
+        goto done;
+    }
+
+    dest_sock.sin_family = AF_INET;
+    dest_sock.sin_port = htons(server_port);
+    dest_sock.sin_addr.s_addr = inet_addr2(server_name);
+    bzero(&(dest_sock.sin_zero), sizeof(dest_sock.sin_zero));
+
+    if (connect(
+            sockfd, (sockaddr *)&dest_sock,
+            sizeof(struct sockaddr)) == -1)
+    {
+        log_d(
+            TLS_CLIENT "failed to connect to %d:%d (errno=%d)\n",
+            server_port,
+            server_port,
+            errno);
+        ocall_close(&res, sockfd);
+        if (res != 0)
+            log_d(TLS_CLIENT "OCALL: error closing socket\n");
+        sockfd = -1;
+        goto done;
+    }
+    log_d(TLS_CLIENT "connected to %s:%d\n", server_name, server_port);
+
+done:
+    return sockfd;
+}
+
+int enclave_connect_and_get_domainkey(SSL *ssl_session)
+{
+    int ret = -1;
+    SSL_CTX *ssl_client_ctx = nullptr;
+    X509 *cert = nullptr;
+    EVP_PKEY *pkey = nullptr;
+    SSL_CONF_CTX *ssl_confctx = SSL_CONF_CTX_new();
+
+    int client_socket = -1;
+    int error = 0;
+
+    log_d("\nStarting" TLS_CLIENT "\n\n\n");
+
+    if ((ssl_client_ctx = SSL_CTX_new(TLS_client_method())) == nullptr)
+    {
+        log_d(TLS_CLIENT "unable to create a new SSL context\n");
+        goto done;
+    }
+
+    if (SSL_CTX_set_cipher_list(ssl_client_ctx, "TLS_AES_256_GCM_SHA384") != SGX_SUCCESS)
+    {
+        log_d(TLS_CLIENT "unable to create SSL_CTX_set_cipher_list\n ");
+        goto done;
+    }
+
+    if (initalize_ssl_context(ssl_confctx, ssl_client_ctx) != SGX_SUCCESS)
+    {
+        log_d(TLS_CLIENT "unable to create a initialize SSL context\n ");
+        goto done;
+    }
+
+    // specify the verify_callback for custom verification
+    SSL_CTX_set_verify(ssl_client_ctx, SSL_VERIFY_PEER, &verify_callback);
+    log_d(TLS_CLIENT "load cert and key\n");
+    if (load_tls_certificates_and_keys(ssl_client_ctx, cert, pkey) != 0)
+    {
+        log_d(TLS_CLIENT
+              " unable to load certificate and private key on the client\n");
+        goto done;
+    }
+
+    if ((ssl_session = SSL_new(ssl_client_ctx)) == nullptr)
+    {
+        log_d(TLS_CLIENT
+              "Unable to create a new SSL connection state object\n");
+        goto done;
+    }
+
+    log_d(TLS_CLIENT "new ssl connection getting created\n");
+    client_socket = create_socket(g_server_name, g_server_port);
+    if (client_socket == -1)
+    {
+        log_d(
+            TLS_CLIENT
+            "create a socket and initiate a TCP connect to server: %s:%d "
+            "(errno=%d)\n",
+            g_server_name,
+            g_server_port,
+            errno);
+        goto done;
+    }
+
+    // set up ssl socket and initiate TLS connection with TLS server
+    if (SSL_set_fd(ssl_session, client_socket) != 1)
+    {
+        log_d(TLS_CLIENT "ssl set fd error.\n");
+    }
+    else
+    {
+        log_d(TLS_CLIENT "ssl set fd succeed.\n");
+    }
+
+    if ((error = SSL_connect(ssl_session)) != 1)
+    {
+        log_d(
+            TLS_CLIENT "Error: Could not establish a TLS session ret2=%d "
+                       "SSL_get_error()=%d\n",
+            error,
+            SSL_get_error(ssl_session, error));
+        goto done;
+    }
+    log_d(
+        TLS_CLIENT "successfully established TLS channel:%s\n",
+        SSL_get_version(ssl_session));
+
+    if ((error = getDomainkey()) != 0)
+    {
+        log_d(TLS_CLIENT "Failed: get domainkey (ret=%d)\n", error);
+        goto done;
+    }
+    ret = 0;
+done:
+
+    if (cert)
+        X509_free(cert);
+
+    if (pkey)
+        EVP_PKEY_free(pkey);
+
+    if (ssl_client_ctx)
+        SSL_CTX_free(ssl_client_ctx);
+
+    if (ssl_confctx)
+        SSL_CONF_CTX_free(ssl_confctx);
+    if (ret == -1)
+    {
+        if (ssl_session)
+            SSL_free(ssl_session);
+        SSL_shutdown(ssl_session);
+    }
+    return ret;
+}
+
+int getDomainkey()
 {
     unsigned char buf[200];
     int ret = 1;
@@ -122,13 +280,13 @@ int communicate_with_server(SSL *ssl)
     int bytes_written = 0;
     int bytes_read = 0;
 
-    // Write an GET request to the server
+    // Write an GET domainkey request to the server
     log_d(TLS_CLIENT "-----> Write to server:\n");
-    len = snprintf((char *)buf, sizeof(buf) - 1, CLIENT_PAYLOAD);
+    len = snprintf((char *)buf, sizeof(buf) - 1, "GET_DOMAINKEY_PAYLOAD");
 
-    while ((bytes_written = SSL_write(ssl, buf, (size_t)len)) <= 0)
+    while ((bytes_written = SSL_write(g_ssl_session, buf, (size_t)len)) <= 0)
     {
-        error = SSL_get_error(ssl, bytes_written);
+        error = SSL_get_error(g_ssl_session, bytes_written);
         if (error == SSL_ERROR_WANT_WRITE)
             continue;
         log_d(TLS_CLIENT "Failed! SSL_write returned %d\n", error);
@@ -138,17 +296,17 @@ int communicate_with_server(SSL *ssl)
 
     log_d(TLS_CLIENT "%d bytes written\n", bytes_written);
 
-    // Read the HTTP response from server
+    // Read the domainkey response from server
     log_d(TLS_CLIENT "<---- Read from server:\n");
     do
     {
         len = sizeof(buf) - 1;
         memset(buf, 0, sizeof(buf));
-        bytes_read = SSL_read(ssl, buf, (size_t)len);
+        bytes_read = SSL_read(g_ssl_session, buf, (size_t)len);
 
         if (bytes_read <= 0)
         {
-            int error = SSL_get_error(ssl, bytes_read);
+            int error = SSL_get_error(g_ssl_session, bytes_read);
             if (error == SSL_ERROR_WANT_READ)
                 continue;
 
@@ -200,180 +358,174 @@ done:
     return ret;
 }
 
-// create a socket and connect to the server_name:server_port
-int create_socket(const char *server_name, uint16_t server_port)
+static void *HeartbeatToServerHandler(void *arg)
 {
-    int sockfd = -1;
-    struct sockaddr_in dest_sock;
+    int len = 0;
+    int error = 0;
+    int bytes_written = 0;
+    int numberOfErrors = 0;
+    int reconnect = 10;
+    char heart_msg[] = "heart_msg";
+
     int res = -1;
 
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd == -1)
+    while (true)
     {
-        log_d(TLS_CLIENT "Error: Cannot create socket %d.\n", errno);
-        goto done;
+        if (g_ssl_session != nullptr)
+        {
+            while (numberOfErrors < reconnect)
+            {
+                ocall_sleep(1);
+                if (bytes_written = SSL_write(g_ssl_session, heart_msg, strlen(heart_msg)) <= 0)
+                {
+                    error = SSL_get_error(g_ssl_session, bytes_written);
+                    if (error == SSL_ERROR_WANT_WRITE)
+                        continue;
+                    log_d(TLS_SERVER "Failed! SSL_write returned %d\n", error);
+                    numberOfErrors++;
+                }
+                else
+                    numberOfErrors = 0;
+                log_i("client send heart bytes_written %d\n", bytes_written);
+            }
+        }
+
+        if (g_ssl_session)
+        {
+            SSL_shutdown(g_ssl_session);
+            SSL_free(g_ssl_session);
+            ocall_close(&res, SSL_get_fd(g_ssl_session));
+            g_ssl_session = nullptr;
+        }
+        if (-1 != enclave_connect_and_get_domainkey(g_ssl_session))
+        {
+            log_d(TLS_CLIENT "Failed: reconnect_with_server\n");
+            pthread_exit((void *)-1);
+        }
+        numberOfErrors = 0;
     }
-
-    dest_sock.sin_family = AF_INET;
-    dest_sock.sin_port = htons(server_port);
-    dest_sock.sin_addr.s_addr = inet_addr2(server_name);
-    bzero(&(dest_sock.sin_zero), sizeof(dest_sock.sin_zero));
-
-    if (connect(
-            sockfd, (sockaddr *)&dest_sock,
-            sizeof(struct sockaddr)) == -1)
-    {
-        log_d(
-            TLS_CLIENT "failed to connect to %d:%d (errno=%d)\n",
-            server_port,
-            server_port,
-            errno);
-        ocall_close(&res, sockfd);
-        if (res != 0)
-            log_d(TLS_CLIENT "OCALL: error closing socket\n");
-        sockfd = -1;
-        goto done;
-    }
-    log_d(TLS_CLIENT "connected to %s:%d\n", server_name, server_port);
-
-done:
-    return sockfd;
 }
 
-int enclave_launch_tls_client(const char *server_name, uint16_t server_port)
+int UpdateRotateFlag(bool rotate_flag)
+{
+    int ret = 0;
+    if (ocall_update_rotate_flag(&rotate_flag) != SGX_SUCCESS)
+    {
+        ret = 1;
+        log_e("OCALL status failed.\n");
+    }
+    return ret;
+}
+
+static void *RotateMsgHandler(void *args)
+{
+    unsigned char buf[200];
+    int ret = 1;
+    int error = 0;
+    int len = 0;
+    int bytes_read = 0;
+
+    do
+    {
+        if (g_ssl_session == nullptr)
+        {
+            continue;
+        }
+        len = sizeof(buf) - 1;
+        memset(buf, 0, sizeof(buf));
+        bytes_read = SSL_read(g_ssl_session, buf, (size_t)len);
+
+        if (bytes_read <= 0)
+        {
+            int error = SSL_get_error(g_ssl_session, bytes_read);
+            if (error == SSL_ERROR_WANT_READ)
+                continue;
+
+            log_d(TLS_CLIENT "Failed! SSL_read returned error=%d\n", error);
+            ret = bytes_read;
+            // TODO: heartbeat handle the error so dont need error handler here?
+            break;
+        }
+
+        log_d(TLS_CLIENT " %d bytes read\n", bytes_read);
+        switch (bytes_read)
+        {
+        case HEART_PAYLOAD_SIZE:
+            break;
+        case ROTATE_PAYLOAD_SIZE:
+            switch (buf[0])
+            {
+            case ROTATE_START:
+            {
+                if (UpdateRotateFlag(ROTATE_START))
+                {
+                    log_d(TLS_CLIENT "Failed: update rotate flag\n");
+                    ret = -1;
+                    goto done;
+                }
+            }
+            break;
+            case ROTATE_END:
+            {
+                if ((ret = getDomainkey()) != 0)
+                {
+                    log_d(TLS_CLIENT "Failed: get domainkey (ret=%d)\n", ret);
+                    goto done;
+                }
+                if (UpdateRotateFlag(ROTATE_END))
+                {
+                    log_d(TLS_CLIENT "Failed: update rotate flag\n");
+                    ret = -1;
+                    goto done;
+                }
+                break;
+            default:
+                break;
+            }
+            break;
+            }
+        default:
+            break;
+        }
+    } while (1);
+done:
+    return (void*)0;
+}
+
+int enclave_launch_tls_client(char *server_name, uint16_t server_port)
 {
     log_d(TLS_CLIENT " called launch tls client\n");
 
     int ret = -1;
-
-    SSL_CTX *ssl_client_ctx = nullptr;
-    SSL *ssl_session = nullptr;
-
-    X509 *cert = nullptr;
-    EVP_PKEY *pkey = nullptr;
-    SSL_CONF_CTX *ssl_confctx = SSL_CONF_CTX_new();
-
-    int client_socket = -1;
-    int error = 0;
-    if (server_name == NULL)
+    if (server_name = nullptr)
     {
-        log_d("Starting" TLS_CLIENT "failed: server name unavailable.\n");
+        log_d(TLS_CLIENT "Failed: null server_name");
         goto done;
     }
-    log_d("\nStarting" TLS_CLIENT "\n\n\n");
-
-    if ((ssl_client_ctx = SSL_CTX_new(TLS_client_method())) == nullptr)
+    g_server_name = server_name;
+    g_server_port = server_port;
+    if (-1 != enclave_connect_and_get_domainkey(g_ssl_session))
     {
-        log_d(TLS_CLIENT "unable to create a new SSL context\n");
+        log_d(TLS_CLIENT "Failed: reconnect_with_server\n");
         goto done;
     }
 
-    if (SSL_CTX_set_cipher_list(ssl_client_ctx, "TLS_AES_256_GCM_SHA384") != SGX_SUCCESS)
+    pthread_t heartbeat_to_server_thread, rotation_thread;
+    if (pthread_create(&heartbeat_to_server_thread, NULL, HeartbeatToServerHandler, NULL) < 0)
     {
-        log_d(TLS_CLIENT "unable to create SSL_CTX_set_cipher_list\n ");
+        log_d("could not create thread\n");
         goto done;
     }
 
-    if (initalize_ssl_context(ssl_confctx, ssl_client_ctx) != SGX_SUCCESS)
+    if (pthread_create(&rotation_thread, NULL, RotateMsgHandler, NULL) < 0)
     {
-        log_d(TLS_CLIENT "unable to create a initialize SSL context\n ");
-        goto done;
-    }
-
-    // specify the verify_callback for custom verification
-    SSL_CTX_set_verify(ssl_client_ctx, SSL_VERIFY_PEER, &verify_callback);
-    log_d(TLS_CLIENT "load cert and key\n");
-    if (load_tls_certificates_and_keys(ssl_client_ctx, cert, pkey) != 0)
-    {
-        log_d(TLS_CLIENT
-              " unable to load certificate and private key on the client\n");
-        goto done;
-    }
-
-    if ((ssl_session = SSL_new(ssl_client_ctx)) == nullptr)
-    {
-        log_d(TLS_CLIENT
-              "Unable to create a new SSL connection state object\n");
-        goto done;
-    }
-
-    log_d(TLS_CLIENT "new ssl connection getting created\n");
-    client_socket = create_socket(server_name, server_port);
-    if (client_socket == -1)
-    {
-        log_d(
-            TLS_CLIENT
-            "create a socket and initiate a TCP connect to server: %s:%d "
-            "(errno=%d)\n",
-            server_name,
-            server_port,
-            errno);
-        goto done;
-    }
-
-    // set up ssl socket and initiate TLS connection with TLS server
-    if (SSL_set_fd(ssl_session, client_socket) != 1)
-    {
-        log_d(TLS_CLIENT "ssl set fd error.\n");
-    }
-    else
-    {
-        log_d(TLS_CLIENT "ssl set fd succeed.\n");
-    }
-
-    if ((error = SSL_connect(ssl_session)) != 1)
-    {
-        log_d(
-            TLS_CLIENT "Error: Could not establish a TLS session ret2=%d "
-                       "SSL_get_error()=%d\n",
-            error,
-            SSL_get_error(ssl_session, error));
-        goto done;
-    }
-    log_d(
-        TLS_CLIENT "successfully established TLS channel:%s\n",
-        SSL_get_version(ssl_session));
-
-    // start the client server communication
-    if ((error = communicate_with_server(ssl_session)) != 0)
-    {
-        log_d(TLS_CLIENT "Failed: communicate_with_server (ret=%d)\n", error);
+        log_d("could not create thread\n");
         goto done;
     }
 
     // Free the structures we don't need anymore
     ret = 0;
 done:
-
-    if (client_socket != -1)
-    {
-        int closeRet;
-        ocall_close(&closeRet, client_socket);
-        if (closeRet != 0)
-        {
-            log_d(TLS_CLIENT "OCALL: error close socket\n");
-            ret = -1;
-        }
-    }
-
-    if (ssl_session)
-    {
-        SSL_shutdown(ssl_session);
-        SSL_free(ssl_session);
-    }
-
-    if (cert)
-        X509_free(cert);
-
-    if (pkey)
-        EVP_PKEY_free(pkey);
-
-    if (ssl_client_ctx)
-        SSL_CTX_free(ssl_client_ctx);
-
-    if (ssl_confctx)
-        SSL_CONF_CTX_free(ssl_confctx);
-
     log_d(TLS_CLIENT " %s\n", (ret == 0) ? "success" : "failed");
     return ret;
 }

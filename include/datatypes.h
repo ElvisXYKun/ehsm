@@ -219,6 +219,12 @@ typedef enum {
     LOG_ERROR = 40000
 } log_type;
 
+typedef struct FdPoolStruct
+{
+    int fd;
+    int errorCnt;
+} FdPool;
+
 //Format of the AES-GCM message being exchanged between the source and the destination enclaves
 typedef struct _secure_message_t
 {

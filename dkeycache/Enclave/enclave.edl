@@ -55,6 +55,8 @@ enclave {
         void ocall_get_current_time([out] uint64_t *p_current_time);
         int ocall_socket (int domain, int type, int protocol) propagate_errno;
         int ocall_connect (int fd, [in, size=len] const struct sockaddr *addr, socklen_t len) propagate_errno;
+        void ocall_sleep(int second);
+        void ocall_update_rotate_flag([in] const bool *rotate_flag);
     };
 
     trusted {       
