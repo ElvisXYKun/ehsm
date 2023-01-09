@@ -28,7 +28,13 @@
 #define ENCLAVE_PATH "libenclave-ehsm-dkeycache.signed.so"
 #include <inttypes.h>
 
+#define CONCURRENT_MAX 32
+
+FdPool g_client_resrved_fds[CONCURRENT_MAX] = {{0, 0}};
+
 sgx_enclave_id_t g_enclave_id;
+
+bool g_is_ready = false; // dkeycache get latest domainkey the status is ready or (ROTATE_START connect failed) status is not ready
 
 void ocall_print_string(uint32_t log_level, const char *str, const char *filename, uint32_t line)
 {
@@ -46,9 +52,53 @@ void ocall_print_string(uint32_t log_level, const char *str, const char *filenam
     }
 }
 
+void ocall_update_rotate_flag(const bool *rotate_flag)
+{
+    _response_header_t *rotate_msg = nullptr;
+    rotate_msg = (ehsm_tls_msg_t *)malloc(sizeof(_response_header_t));
+    if (rotate_msg = nullptr)
+    {
+        log_d(TLS_CLIENT "getDomainkey malloc failed\n");
+        goto out;
+    }
+    if (*rotate_flag)
+    {
+        rotate_msg->type = MSG_ROTATE_START;
+        g_is_ready = false;
+        log_i("dkeycache is ready is set to false\n");
+    }
+    else
+    {
+        rotate_msg->type = MSG_ROTATE_END;
+        g_is_ready = true;
+        log_i("dkeycache is ready is set to true\n");
+    }
+
+    for (int i = 0; i < CONCURRENT_MAX; i++)
+    {
+        if (g_client_resrved_fds[i].fd != 0)
+        {
+            // error is handled by heartbeat;
+            send(g_client_resrved_fds[i].fd, reinterpret_case<char *> rotate_msg, sizeof(_response_header_t), MSG_NOSIGNAL);
+        }
+    }
+    SAFE_FREE(rotate_msg)
+}
+
+void ocall_update_is_ready(const bool *is_ready)
+{
+    g_is_ready = *is_ready;
+    log_i("is ready set to %s\n", g_is_ready == true ? "true" : "false");
+}
+
 int ocall_close(int fd)
 {
     return close(fd);
+}
+
+void ocall_sleep(int second)
+{
+    sleep(second);
 }
 
 void ocall_get_current_time(uint64_t *p_current_time)
@@ -131,6 +181,7 @@ static void show_usage_and_exit(int code)
     log_i("\nusage: ehsm-dkeycache -i 127.0.0.1 -p 8888\n\n");
     exit(code);
 }
+
 static void parse_args(int argc, char *argv[])
 {
     int opt;

@@ -54,6 +54,7 @@ class LaServer
 	private:
 		LaTask *m_cptask; // this is task queue which process received request message
 		int m_server_sock_fd;
+		int m_server_resrved_fd;
 		int m_shutdown;
 
 	private:

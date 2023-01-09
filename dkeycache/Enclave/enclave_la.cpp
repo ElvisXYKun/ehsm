@@ -47,7 +47,7 @@
 
 #include "sgx_tcrypto.h"
 
-void log_printf(uint32_t log_level, const char* filename, uint32_t line, const char *fmt, ...);
+extern void log_printf(uint32_t log_level, const char* filename, uint32_t line, const char *fmt, ...);
 
 #define MAX_SESSION_COUNT  16
 
@@ -65,7 +65,6 @@ std::map<uint32_t, dh_session_t>g_dest_session_info_map;
 std::map<sgx_enclave_id_t, dh_session_t>g_src_session_info_map;
 
 #define UNUSED(val) (void)(val)
-
 
 // this is expected initiator's MRSIGNER for demonstration purpose 
 sgx_measurement_t g_initiator_mrsigner = {
