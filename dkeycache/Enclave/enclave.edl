@@ -57,6 +57,7 @@ enclave {
         int ocall_connect (int fd, [in, size=len] const struct sockaddr *addr, socklen_t len) propagate_errno;
         void ocall_sleep(int second);
         void ocall_update_rotate_flag([in] const bool *rotate_flag);
+        void ocall_update_is_ready([in] const bool *is_ready);
     };
 
     trusted {       

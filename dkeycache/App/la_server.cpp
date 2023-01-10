@@ -48,8 +48,10 @@
 #define CONCURRENT_MAX 32
 #define SERVER_PORT 8888
 #define BUFFER_SIZE 1024
+#define RECONNECT_TIMES 3
+#define SLEEP_INTV 3
 
-extern bool g_rotate_flag;
+extern bool g_is_ready;
 extern FdPool g_client_resrved_fds[CONCURRENT_MAX];
 
 /* Function Description:
@@ -58,35 +60,48 @@ extern FdPool g_client_resrved_fds[CONCURRENT_MAX];
  * In Windows, it would listen on port 8888, which is for demonstration purpose
  * */
 
-static void *HeartbeatToCoreHandler(void* args)
+static void *HeartbeatToClientHandler(void *args)
 {
     int bytes_written = 0;
-    int reconnect = 10;
-    char heart_msg[] = "heart_msg";
-
+    _response_header_t *heart_beat = nullptr;
+    heart_beat = (_response_header_t *)malloc(sizeof(_response_header_t));
+    if (heart_beat == nullptr)
+    {
+        log_d("getDomainkey malloc failed\n");
+        goto out;
+    }
+    heart_beat->type = MSG_HEARTBEAT;
     while (true)
     {
-        ocall_sleep(1);
+        ocall_sleep(SLEEP_INTV);
         for (int i = 0; i < CONCURRENT_MAX; i++)
         {
             if (g_client_resrved_fds[i].fd != 0)
             {
-                if (g_client_resrved_fds[i].errorCnt < reconnect)
+                if (g_client_resrved_fds[i].errorCnt < RECONNECT_TIMES)
                 {
-                    while (bytes_written = send(g_client_resrved_fds[i].fd, heart_msg, strlen(heart_msg), MSG_NOSIGNAL) <= 0)
+                    bytes_written = send(g_client_resrved_fds[i].fd, reinterpret_cast<char *>(heart_beat), sizeof(_response_header_t), MSG_NOSIGNAL);
+                    if (bytes_written<= 0)
                     {
                         g_client_resrved_fds[i].errorCnt++;
-                        break;
                     }
-                    g_client_resrved_fds[i].errorCnt = 0;
-                    log_i("client send heart bytes_written %d\n", bytes_written);
+                    else
+                    {
+                        g_client_resrved_fds[i].errorCnt = 0;
+                    }
                 }
-                close(g_client_resrved_fds[i].fd);
-                g_client_resrved_fds[i].fd = 0;
-                g_client_resrved_fds[i].errorCnt = 0;
+                else
+                {
+                    close(g_client_resrved_fds[i].fd);
+                    g_client_resrved_fds[i].fd = 0;
+                    g_client_resrved_fds[i].errorCnt = 0;
+                }
             }
         }
     }
+out:
+    SAFE_FREE(heart_beat);
+    pthread_exit((void *)-1);
 }
 
 int LaServer::init()
@@ -155,8 +170,8 @@ void LaServer::doWork()
     struct timeval tv;
     char input_msg[BUFFER_SIZE];
     char recv_msg[BUFFER_SIZE];
-    pthread_t HeartbeatToCore_thread;
-    if (pthread_create(&HeartbeatToCore_thread, NULL, HeartbeatToCoreHandler, NULL) < 0)
+    pthread_t HeartbeatToClient_thread;
+    if (pthread_create(&HeartbeatToClient_thread, NULL, HeartbeatToClientHandler, NULL) < 0)
     {
         log_d("could not create thread\n");
         // error handler
@@ -176,6 +191,10 @@ void LaServer::doWork()
         FD_SET(m_server_sock_fd, &server_fd_set);
         if (max_fd < m_server_sock_fd)
             max_fd = m_server_sock_fd;
+
+        FD_SET(m_server_resrved_fd, &server_fd_set);
+        if (max_fd < m_server_resrved_fd)
+            max_fd = m_server_resrved_fd;
 
         // listening on all client connections
         for (int i = 0; i < CONCURRENT_MAX; i++)
@@ -208,7 +227,7 @@ void LaServer::doWork()
 
             // accept this connection request
             int client_sock_fd = accept(m_server_sock_fd, (struct sockaddr *)&clt_addr, &len);
-            if (g_rotate_flag == true)
+            if (g_is_ready == false)
             {
                 close(client_sock_fd);
                 client_sock_fd = 0;
@@ -240,6 +259,50 @@ void LaServer::doWork()
             {
                 log_d("server: accept() return failure, %s, would exit.\n", strerror(errno));
                 close(m_server_sock_fd);
+                break;
+            }
+        }
+
+        if (FD_ISSET(m_server_resrved_fd, &server_fd_set))
+        {
+            // if there is new connection request
+            struct sockaddr_un clt_addr;
+            socklen_t len = sizeof(clt_addr);
+
+            // accept this connection request
+            int client_sock_fd = accept(m_server_resrved_fd, (struct sockaddr *)&clt_addr, &len);
+            if (g_is_ready == false)
+            {
+                close(client_sock_fd);
+                client_sock_fd = 0;
+            }
+
+            if (client_sock_fd > 0)
+            {
+                // add new connection to connection pool if it's not full
+                int index = -1;
+                for (int i = 0; i < CONCURRENT_MAX; i++)
+                {
+                    if (g_client_resrved_fds[i].fd == 0)
+                    {
+                        index = i;
+                        g_client_resrved_fds[i].fd = client_sock_fd;
+                        break;
+                    }
+                }
+
+                if (index < 0)
+                {
+                    log_i("server reach maximum connection!\n");
+                    bzero(input_msg, BUFFER_SIZE);
+                    strcpy(input_msg, "server reach maximum connection\n");
+                    send(client_sock_fd, input_msg, BUFFER_SIZE, 0);
+                }
+            }
+            else if (client_sock_fd < 0)
+            {
+                log_d("server: accept() return failure, %s, would exit.\n", strerror(errno));
+                close(m_server_resrved_fd);
                 break;
             }
         }

@@ -225,6 +225,37 @@ typedef struct FdPoolStruct
     int errorCnt;
 } FdPool;
 
+typedef enum
+{
+    MSG_HEARTBEAT = 0,
+    MSG_ROTATE_START = -1,
+    MSG_ROTATE_END = -2,
+    MSG_DOMAINKEY = -4
+} ehsm_tls_msg_type_t;
+
+typedef enum {
+    UNKNOWN_CMD = 0,
+    GET_DOMAINKEY = 1,
+    START_ROTATION = 2,
+    STOP_AUTO_ROTATION = 3,        
+    SET_PERIOD = 4,
+    GET_PERIOD = 5,
+    GET_NEXT_ROTATION_DATETIME = 6,
+    UPDATE_CMK = 7
+} dkeyserver_command;
+
+typedef struct _request_header_t{
+    dkeyserver_command cmd;
+    size_t period;
+    size_t password;
+}_request_header_t;
+
+typedef struct _response_header_t{
+    uint32_t type;
+    uint8_t domainKey[32];
+    size_t period;
+}_response_header_t;
+
 //Format of the AES-GCM message being exchanged between the source and the destination enclaves
 typedef struct _secure_message_t
 {
